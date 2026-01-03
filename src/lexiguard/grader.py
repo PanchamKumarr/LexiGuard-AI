@@ -40,6 +40,29 @@ def create_hallucination_grader(model: str = "gpt-4o", temperature: float = 0):
     hallucination_grader = hallucination_prompt | structured_llm_grader
     return hallucination_grader
 
-# Example usage in a graph node:
-# grader = create_hallucination_grader()
-# score = grader.invoke({"documents": docs, "generation": answer})
+class GradeRetrieval(BaseModel):
+    """Binary score for retrieval check."""
+    binary_score: str = Field(
+        description="Retrieved documents are relevant and sufficient to answer the query, 'yes' or 'no'"
+    )
+
+def create_retrieval_grader(model: str = "gpt-4o", temperature: float = 0):
+    """
+    Creates a retrieval grader to check if the retrieved context is enough.
+    """
+    llm = ChatOpenAI(model=model, temperature=temperature)
+    structured_llm_grader = llm.with_structured_output(GradeRetrieval)
+
+    system = """You are a grader assessing whether the retrieved legal documents are relevant and sufficient to answer the user's query. \n
+         If the query mentions specific Indian Acts, Sections, or requires external legal verification not found in the facts, score it 'no'. \n
+         Give a binary score 'yes' or 'no'. 'Yes' means the facts are sufficient to answer the query."""
+    
+    retrieval_prompt = ChatPromptTemplate.from_messages(
+        [
+            ("system", system),
+            ("human", "Retrieved facts: \n\n {documents} \n\n User query: {query}"),
+        ]
+    )
+
+    retrieval_grader = retrieval_prompt | structured_llm_grader
+    return retrieval_grader

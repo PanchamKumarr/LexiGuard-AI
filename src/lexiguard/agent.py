@@ -10,7 +10,9 @@ from langchain_community.document_loaders import PyPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_chroma import Chroma
 from langchain_core.tools import tool
-from lexiguard.grader import create_hallucination_grader
+from lexiguard.grader import create_hallucination_grader, create_retrieval_grader
+from lexiguard.tools import indian_kanoon_search
+from langchain_core.messages import AIMessage
 
 load_dotenv()
 
@@ -24,6 +26,13 @@ def get_llm(model: str = DEFAULT_MODEL, temperature: float = LLM_TEMP):
 
 llm = get_llm()
 hallucination_grader = create_hallucination_grader(model=DEFAULT_MODEL, temperature=LLM_TEMP)
+retrieval_grader = create_retrieval_grader(model=DEFAULT_MODEL, temperature=LLM_TEMP)
+
+SYSTEM_PROMPT = """You are LexiGuard AI, a high-precision legal and compliance research assistant.
+Your goal is to provide accurate, grounded, and legally sound advice.
+Always prioritize internal compliance documents provided in the context.
+If the context is insufficient or if the query involves specific Indian Acts/Sections, use the legal_verification tool to cross-reference with Indian Kanoon.
+"""
 
 # --- Vector Store Setup (Domain Pivot) ---
 # Note: In production, this would be replaced by Pinecone as per the plan.
@@ -57,7 +66,7 @@ def legal_research_tool(query: str) -> str:
     docs = retriever.invoke(query)
     return "\n\n".join([f"Source Match {i+1}:\n{d.page_content}" for i, d in enumerate(docs)])
 
-tools = [legal_research_tool]
+tools = [legal_research_tool, indian_kanoon_search]
 llm_with_tools = llm.bind_tools(tools)
 
 # --- Graph State & Logic ---
@@ -78,12 +87,47 @@ def call_tool(state: AgentState):
     tool_calls = state['messages'][-1].tool_calls
     results = []
     docs = []
+    tool_map = {
+        "legal_research_tool": legal_research_tool,
+        "indian_kanoon_search": indian_kanoon_search
+    }
     for t in tool_calls:
         print(f"Executing: {t['name']}")
-        res = legal_research_tool.invoke(t['args'].get('query', ''))
-        docs.append(res)
-        results.append(ToolMessage(tool_call_id=t['id'], name=t['name'], content=res))
+        tool_to_call = tool_map.get(t['name'])
+        if tool_to_call:
+            res = tool_to_call.invoke(t['args'])
+            docs.append(res)
+            results.append(ToolMessage(tool_call_id=t['id'], name=t['name'], content=res))
     return {"messages": results, "documents": docs}
+
+def legal_verification(state: AgentState):
+    """
+    Forces a search on Indian Kanoon when retrieval is insufficient.
+    """
+    last_query = state['messages'][0].content
+    print(f"[LexiGuard] Insufficient internal data. Triggering legal verification for: {last_query}")
+    
+    res = indian_kanoon_search.invoke({"query": last_query})
+    return {
+        "documents": [res],
+        "messages": [AIMessage(content="I am cross-referencing this with Indian Kanoon for legislative verification.")]
+    }
+
+def grade_retrieval(state: AgentState):
+    """
+    Checks if retrieved docs are sufficient for the query.
+    """
+    last_query = state['messages'][0].content
+    docs = "\n\n".join(state.get('documents', []))
+    
+    score = retrieval_grader.invoke({"documents": docs, "query": last_query})
+    
+    if score.binary_score == "yes":
+        print("[LexiGuard] Internal documentation is sufficient.")
+        return "sufficient"
+    else:
+        print("[LexiGuard] Internal documentation is insufficient. Requesting legal verification.")
+        return "insufficient"
 
 def exit_ungrounded(state: AgentState):
     """Graceful exit when no grounded answer is found."""
@@ -134,6 +178,7 @@ def build_legal_graph():
     builder.add_node("tools", call_tool)
     builder.add_node("increment_loop", increment_loop)
     builder.add_node("exit_ungrounded", exit_ungrounded)
+    builder.add_node("legal_verification", legal_verification)
     
     builder.set_entry_point("agent")
     
@@ -142,7 +187,18 @@ def build_legal_graph():
         should_continue,
         {
             "tools": "tools",
-            "grade": "grade_check_logic"
+            "grade": "grade_retrieval_router"
+        }
+    )
+    
+    builder.add_node("grade_retrieval_router", lambda state: state)
+    
+    builder.add_conditional_edges(
+        "grade_retrieval_router",
+        grade_retrieval,
+        {
+            "sufficient": "grade_check_logic",
+            "insufficient": "legal_verification"
         }
     )
     
@@ -158,6 +214,7 @@ def build_legal_graph():
         }
     )
     
+    builder.add_edge("legal_verification", "agent")
     builder.add_edge("increment_loop", "agent")
     builder.add_edge("tools", "agent")
     builder.add_edge("exit_ungrounded", END)
